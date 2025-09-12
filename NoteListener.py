@@ -1,111 +1,129 @@
-import pyaudio
+import copy
+import os
 import numpy as np
-import aubio
+import scipy.fftpack
+import sounddevice as sd
+import time
 
-# Parameters for audio stream
-CHUNK = 4096  # Increased chunk size for better frequency resolution
-FORMAT = pyaudio.paInt16  # Data type format (16-bit audio)
-CHANNELS = 1  # Mono audio
-RATE = 44100  # Sampling rate (samples per second)
+# General settings
+SAMPLE_FREQ = 48000  # sample frequency in Hz
+WINDOW_SIZE = 48000  # window size of the DFT in samples
+WINDOW_STEP = 12000  # step size of window
+NUM_HPS = 5  # max number of harmonic product spectrums
+POWER_THRESH = 1e-6  # tuning is activated if the signal power exceeds this threshold
+CONCERT_PITCH = 440  # defining a1
+WHITE_NOISE_THRESH = 0.2  # everything under WHITE_NOISE_THRESH*avg_energy_per_freq is cut off
 
-# Initialize PyAudio
-p = pyaudio.PyAudio()
+WINDOW_T_LEN = WINDOW_SIZE / SAMPLE_FREQ  # length of the window in seconds
+SAMPLE_T_LENGTH = 1 / SAMPLE_FREQ  # length between two samples in seconds
+DELTA_FREQ = SAMPLE_FREQ / WINDOW_SIZE  # frequency step width of the interpolated DFT
+OCTAVE_BANDS = [50, 100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600]
 
-# Open a stream with the above settings
-stream = p.open(format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
-                input=True,
-                frames_per_buffer=CHUNK)
-
-# Aubio setup for pitch detection
-win_s = 8192  # Default FFT window size
-hop_s = CHUNK  # Hop size should be equal to CHUNK
-pitch_o = aubio.pitch("default", win_s, hop_s, RATE)
-pitch_o.set_unit("Hz")
-pitch_o.set_silence(-40)  # Adjust sensitivity to ignore silence
-
-# Define frequencies for standard notes
-notes = {
-    "E2": 82.41, "F2": 87.31, "F#2": 92.50, "G2": 98.00,
-    "G#2": 103.83, "A2": 110.00, "A#2": 116.54, "B2": 123.47,
-    "C3": 130.81, "C#3": 138.59, "D3": 146.83, "D#3": 155.56,
-    "E3": 164.81, "F3": 174.61, "F#3": 185.00, "G3": 196.00,
-    "G#3": 207.65, "A3": 220.00, "A#3": 233.08, "B3": 246.94,
-    "C4": 261.63, "C#4": 277.18, "D4": 293.66, "D#4": 311.13,
-    "E4": 329.63, "F4": 349.23, "F#4": 369.99, "G4": 392.00,
-    "G#4": 415.30, "A4": 440.00, "A#4": 466.16, "B4": 493.88,
-    "C5": 523.25, "C#5": 554.37, "D5": 587.33, "D#5": 622.25,
-    "E5": 659.25, "F5": 698.46, "F#5": 739.99, "G5": 783.99,
-    "G#5": 830.61, "A5": 880.00, "A#5": 932.33, "B5": 987.77
-}
+ALL_NOTES = ["A", "A#", "B", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#"]
 
 
-# Function to map frequency to the closest note
-def freq_to_note(freq):
-    if freq == 0:  # No valid frequency detected
-        return None
-    min_diff = float("inf")
-    closest_note = None
-    for note, note_freq in notes.items():
-        diff = abs(freq - note_freq)
-        if diff < min_diff:
-            min_diff = diff
-            closest_note = note
-    return closest_note
+def find_closest_note(pitch):
+    """
+  This function finds the closest note for a given pitch
+  Parameters:
+    pitch (float): pitch given in hertz
+  Returns:
+    closest_note (str): e.g. a, g#, ..
+    closest_pitch (float): pitch of the closest note in hertz
+  """
+    i = int(np.round(np.log2(pitch / CONCERT_PITCH) * 12))
+    closest_note = ALL_NOTES[i % 12] + str(4 + (i + 9) // 12)
+    closest_pitch = CONCERT_PITCH * 2 ** (i / 12)
+    return closest_note, closest_pitch
 
 
-# Dynamically adjust the FFT window size based on the detected pitch
-def adjust_window(freq):
-    if freq < 100:  # Low frequencies (bass notes)
-        pitch_o.set_tolerance(0.6)  # Allow larger tolerance for lower frequencies
-        return 8192  # Large window size
-    elif freq < 300:  # Mid-range frequencies (lower guitar strings)
-        pitch_o.set_tolerance(0.5)
-        return 4096  # Medium window size
-    else:  # High frequencies (upper strings)
-        pitch_o.set_tolerance(0.3)  # Higher precision for upper notes
-        return 2048  # Smaller window size for higher notes
+HANN_WINDOW = np.hanning(WINDOW_SIZE)
 
 
-# Smoothing: Keep track of the last N pitch readings
-smooth_pitch = []
-SAMPLE_WINDOW = 5  # Increased sample window for better averaging
+def callback(indata, frames, time, status):
+    """
+  Callback function of the InputStream method.
+  That's where the magic happens ;)
+  """
+    # define static variables
+    if not hasattr(callback, "window_samples"):
+        callback.window_samples = [0 for _ in range(WINDOW_SIZE)]
+    if not hasattr(callback, "noteBuffer"):
+        callback.noteBuffer = ["1", "2"]
+
+    if status:
+        print(status)
+        return
+    if any(indata):
+        callback.window_samples = np.concatenate((callback.window_samples, indata[:, 0]))  # append new samples
+        callback.window_samples = callback.window_samples[len(indata[:, 0]):]  # remove old samples
+
+        # skip if signal power is too low
+        signal_power = (np.linalg.norm(callback.window_samples, ord=2) ** 2) / len(callback.window_samples)
+        if signal_power < POWER_THRESH:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print("Closest note: ...")
+            return
+
+        # avoid spectral leakage by multiplying the signal with a hann window
+        hann_samples = callback.window_samples * HANN_WINDOW
+        magnitude_spec = abs(scipy.fftpack.fft(hann_samples)[:len(hann_samples) // 2])
+
+        # supress mains hum, set everything below 62Hz to zero
+        for i in range(int(62 / DELTA_FREQ)):
+            magnitude_spec[i] = 0
+
+        # calculate average energy per frequency for the octave bands
+        # and suppress everything below it
+        for j in range(len(OCTAVE_BANDS) - 1):
+            ind_start = int(OCTAVE_BANDS[j] / DELTA_FREQ)
+            ind_end = int(OCTAVE_BANDS[j + 1] / DELTA_FREQ)
+            ind_end = ind_end if len(magnitude_spec) > ind_end else len(magnitude_spec)
+            avg_energy_per_freq = (np.linalg.norm(magnitude_spec[ind_start:ind_end], ord=2) ** 2) / (
+                        ind_end - ind_start)
+            avg_energy_per_freq = avg_energy_per_freq ** 0.5
+            for i in range(ind_start, ind_end):
+                magnitude_spec[i] = magnitude_spec[i] if magnitude_spec[
+                                                             i] > WHITE_NOISE_THRESH * avg_energy_per_freq else 0
+
+        # interpolate spectrum
+        mag_spec_ipol = np.interp(np.arange(0, len(magnitude_spec), 1 / NUM_HPS), np.arange(0, len(magnitude_spec)),
+                                  magnitude_spec)
+        mag_spec_ipol = mag_spec_ipol / np.linalg.norm(mag_spec_ipol, ord=2)  # normalize it
+
+        hps_spec = copy.deepcopy(mag_spec_ipol)
+
+        # calculate the HPS
+        for i in range(NUM_HPS):
+            tmp_hps_spec = np.multiply(hps_spec[:int(np.ceil(len(mag_spec_ipol) / (i + 1)))], mag_spec_ipol[::(i + 1)])
+            if not any(tmp_hps_spec):
+                break
+            hps_spec = tmp_hps_spec
+
+        max_ind = np.argmax(hps_spec)
+        max_freq = max_ind * (SAMPLE_FREQ / WINDOW_SIZE) / NUM_HPS
+
+        closest_note, closest_pitch = find_closest_note(max_freq)
+        max_freq = round(max_freq, 1)
+        closest_pitch = round(closest_pitch, 1)
+
+        callback.noteBuffer.insert(0, closest_note)  # note that this is a ringbuffer
+        callback.noteBuffer.pop()
+
+        os.system('cls' if os.name == 'nt' else 'clear')
+        if callback.noteBuffer.count(callback.noteBuffer[0]) == len(callback.noteBuffer):
+            print(f"Closest note: {closest_note} {max_freq}/{closest_pitch}")
+        else:
+            print(f"Closest note: ...")
+
+    else:
+        print('no input')
+
 
 try:
-    print("Recording with Dynamic Pitch Detection...")
-    while True:
-        # Read audio data in chunks
-        data = stream.read(CHUNK)
-
-        # Convert data to numpy array
-        audio_data = np.frombuffer(data, dtype=np.int16)
-
-        # Aubio expects float32
-        pitch = pitch_o(audio_data.astype(np.float32))[0]
-
-        # Dynamically adjust FFT window based on the detected frequency
-        win_s = adjust_window(pitch)
-
-        # Smoothing by averaging over the last SAMPLE_WINDOW readings
-        smooth_pitch.append(pitch)
-        if len(smooth_pitch) > SAMPLE_WINDOW:
-            smooth_pitch.pop(0)
-
-        avg_pitch = sum(smooth_pitch) / len(smooth_pitch)
-
-        # Convert the detected pitch to a musical note
-        note = freq_to_note(avg_pitch)
-        if note:
-            print(f"Detected note: {note} (Frequency: {avg_pitch:.2f} Hz)")
-        else:
-            print("No valid pitch detected.")
-
-except KeyboardInterrupt:
-    print("Stopping recording")
-
-finally:
-    # Close the stream and terminate PyAudio
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
+    print("Starting HPS Note Detection...")
+    with sd.InputStream(channels=1, callback=callback, blocksize=WINDOW_STEP, samplerate=SAMPLE_FREQ):
+        while True:
+            time.sleep(0.5)
+except Exception as exc:
+    print(str(exc))
