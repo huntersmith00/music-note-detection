@@ -1,0 +1,1 @@
+Exploring FFT, Autocorrelation, and ML methods of pitch-detection for real-time and pre-recorded use cases. Additionally exploring NN-classification of music theory contexts/concepts i.e. time signature, key, mode, harmony.
