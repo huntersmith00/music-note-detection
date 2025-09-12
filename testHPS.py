@@ -5,7 +5,7 @@ import scipy.fftpack
 import sounddevice as sd
 import time
 
-# General settings that can be changed by the user
+# General settings
 SAMPLE_FREQ = 48000  # sample frequency in Hz
 WINDOW_SIZE = 48000  # window size of the DFT in samples
 WINDOW_STEP = 12000  # step size of window
@@ -121,7 +121,7 @@ def callback(indata, frames, time, status):
 
 
 try:
-    print("Starting HPS guitar tuner...")
+    print("Starting HPS Note Detection...")
     with sd.InputStream(channels=1, callback=callback, blocksize=WINDOW_STEP, samplerate=SAMPLE_FREQ):
         while True:
             time.sleep(0.5)
