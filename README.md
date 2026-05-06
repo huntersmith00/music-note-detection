@@ -1,4 +1,4 @@
-# Music Note Detection (Prototype)
+# Music Note Detection
 
 ## Overview
 
